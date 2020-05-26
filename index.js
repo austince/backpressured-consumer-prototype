@@ -35,6 +35,8 @@ let isRunning = true;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+const round2 = (num) => Math.round((num + Number.EPSILON) * 100) / 100;
+
 function getConnectionURI() {
   const url = new URL(`amqp://${host}`);
   url.username = username;
@@ -68,15 +70,19 @@ async function statsLoop() {
       queue: {
         unacked: queue.messages_unacknowledged,
         ready: queue.messages_ready,
-        'publish/s': queue.message_stats.publish_details.rate,
-        'deliver/s': queue.message_stats.deliver_details.rate,
+        'publish/s': queue.message_stats && queue.message_stats.publish_details.rate,
+        'deliver/s': queue.message_stats && queue.message_stats.deliver_details.rate,
       },
       consumer: {
         'buffer length': consumer.buffer.length,
+        prefetch: consumer.prefetchAmount,
+      },
+      session: {
+        count: sessionIds.size,
       },
       approxUnacked,
       approxUnackedDelta: queue.messages_unacknowledged - approxUnacked,
-      'Approx. Unacked % error': (queue.messages_unacknowledged - approxUnacked) / queue.messages_unacknowledged,
+      'Approx. Unacked % error': round2((queue.messages_unacknowledged - approxUnacked) / queue.messages_unacknowledged * 100),
     }));
     await sleep(STATS_LOOP_SLEEP_MS);
   }
@@ -133,7 +139,12 @@ class Consumer {
     this.maxBufferLength = CONSUMER_MAX_BUFFER;
     this.connection = connection;
     this.channel = channel;
-    this.channel.prefetch(CONSUMER_MAX_BUFFER * PREFETCH_RATIO);
+    this.maxPrefetchAmount = CONSUMER_MAX_BUFFER * PREFETCH_RATIO;
+    // if there is still room in the buffer
+    // allow as many as possible in
+    // NOTE: need to handle v3.3.0 global semantics: https://www.rabbitmq.com/consumer-prefetch.html
+    this.prefetchAmount = false;
+    this.channel.prefetch(this.prefetchAmount);
   }
 
   consume() {
@@ -144,18 +155,19 @@ class Consumer {
   }
 
   configureQos() {
-    console.debug('Consumer buffer length', this.buffer.length);
+    const curAmount = this.prefetchAmount;
+    // console.debug('Consumer buffer length', this.buffer.length);
     if (this.buffer.length >= this.maxBufferLength) {
       // TODO: backpressure here using qos prefetch
       //    as determined by length of session IDs and current buffer (if buffer is "full")
       // console.debug('Consumer approx unacked', approxUnacked);
       // cap it at the current unacked until there is room for more
-      this.channel.prefetch(this.maxBufferLength);
+      this.prefetchAmount = this.maxPrefetchAmount;
     } else {
-      // if there is still room in the buffer
-      // allow as many as possible in
-      // NOTE: need to handle v3.3.0 global semantics: https://www.rabbitmq.com/consumer-prefetch.html
-      // this.channel.prefetch(false);
+      this.prefetchAmount = false;
+    }
+    if (curAmount !== this.prefetchAmount) {
+      this.channel.prefetch(this.prefetchAmount);
     }
   }
 
