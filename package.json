@@ -1,0 +1,16 @@
+{
+  "name": "backpressured-queue-prototype",
+  "version": "1.0.0",
+  "main": "index.js",
+  "author": "austin ce <austin.cawley@gmail.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@types/amqplib": "^0.5.13",
+    "@types/node-fetch": "^2.5.7",
+    "amqplib": "^0.5.6",
+    "node-fetch": "^2.6.0"
+  },
+  "volta": {
+    "node": "14.3.0"
+  }
+}

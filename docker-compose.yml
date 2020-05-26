@@ -1,0 +1,7 @@
+version: '3.7'
+services:
+  rabbitmq:
+    image: rabbitmq:3.8-management
+    ports:
+      - "5672:5672" # MQ Instance
+      - "15672:15672" # Web MGMT UI
