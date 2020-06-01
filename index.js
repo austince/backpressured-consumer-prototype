@@ -1,7 +1,9 @@
 const { URL } = require('url');
 const amqplib = require('amqplib');
 const fetch = require('node-fetch');
+const yargs = require('yargs');
 
+// connection details
 const host = 'localhost';
 const port = 5672;
 const mgmtPort = 15672;
@@ -10,21 +12,23 @@ const password = 'guest';
 
 const QUEUE_NAME = 'testQueue';
 
+// Parameters
+
 const PUBLISH_SLEEP_MS = 0;
-// let the queue fill up a bit before reading
-const PUBLISHER_HEAD_START_MS = 100;
+const PUBLISHER_HEAD_START_MS = 100; // let the queue fill up a bit before reading
 
-const RUN_LOOP_SLEEP_MS = 0;
-const RUN_LOOP_CHECKPOINT_INTERVAL = 10;
+const CONSUMER_MAX_BUFFER_LENGTH = 50;
 
-const CONSUMER_MAX_BUFFER = 50;
-const PREFETCH_RATIO = 1.5;
+const RUN_LOOP_SLEEP_MS = 100; // time for "processing" for each message
+const RUN_LOOP_CHECKPOINT_INTERVAL_MS = 5000;
 
 const STATS_LOOP_SLEEP_MS = 500;
 
+// State
+
 /** @type {Publisher} */
 let publisher;
-/** @type {Consumer} */
+/** @type {BackpressureAwareConsumer} */
 let consumer;
 /** @type {Set<string>} */
 let sessionIds;
@@ -32,6 +36,10 @@ let sessionIds;
 let sessionMessages;
 
 let isRunning = true;
+
+let shouldPurgeQueue = false;
+
+// Utilities
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -45,48 +53,63 @@ function getConnectionURI() {
   return url.toString();
 }
 
-// set up a queue with same defaults as RMQ connector
 async function declareQueue(channel) {
+  // set up a queue with same defaults as RMQ connector
   await channel.assertQueue(QUEUE_NAME, {
     durable: true,
     exclusive: false,
     autoDelete: false,
     arguments: null,
   });
-  // just in case there are lingerers from a previous run
-  await channel.purgeQueue(QUEUE_NAME);
+  if (shouldPurgeQueue) {
+    // just in case there are lingerers from a previous run
+    console.log('Purging queue');
+    await channel.purgeQueue(QUEUE_NAME);
+  }
+}
+
+// Stats
+
+async function sampleStats() {
+  const mgmtUrl = new URL(`http://${host}:${mgmtPort}/api/queues/${encodeURIComponent('/')}/${QUEUE_NAME}`);
+  mgmtUrl.username = username;
+  mgmtUrl.password = password;
+  const res = await fetch(mgmtUrl);
+  const queue = await res.json();
+  const approxUnacked = consumer.buffer.length + sessionIds.size;
+  console.debug('stats', JSON.stringify({
+    ts: new Date(),
+    queue: {
+      unacked: queue.messages_unacknowledged,
+      ready: queue.messages_ready,
+      'publish/s': queue.message_stats && queue.message_stats.publish_details.rate,
+      'deliver/s': queue.message_stats && queue.message_stats.deliver_details.rate,
+    },
+    consumer: {
+      'buffer length': consumer.buffer.length,
+      remaining: CONSUMER_MAX_BUFFER_LENGTH - consumer.buffer.length,
+      prefetch: consumer.prefetchAmount,
+    },
+    session: {
+      'session length': sessionIds.size,
+    },
+    unacked: {
+      observed: queue.messages_unacknowledged,
+      estimate: approxUnacked,
+      delta: queue.messages_unacknowledged - approxUnacked,
+      '% error': round2((queue.messages_unacknowledged - approxUnacked) / queue.messages_unacknowledged * 100),
+    },
+  }));
 }
 
 async function statsLoop() {
   while (isRunning) {
-    const mgmtUrl = new URL(`http://${host}:${mgmtPort}/api/queues/${encodeURIComponent('/')}/${QUEUE_NAME}`);
-    mgmtUrl.username = username;
-    mgmtUrl.password = password;
-    const res = await fetch(mgmtUrl);
-    const queue = await res.json();
-    const parallelism = 1;
-    const approxUnacked = parallelism * (consumer.buffer.length + sessionIds.size);
-    console.debug('stats', JSON.stringify({
-      queue: {
-        unacked: queue.messages_unacknowledged,
-        ready: queue.messages_ready,
-        'publish/s': queue.message_stats && queue.message_stats.publish_details.rate,
-        'deliver/s': queue.message_stats && queue.message_stats.deliver_details.rate,
-      },
-      consumer: {
-        'buffer length': consumer.buffer.length,
-        prefetch: consumer.prefetchAmount,
-      },
-      session: {
-        count: sessionIds.size,
-      },
-      approxUnacked,
-      approxUnackedDelta: queue.messages_unacknowledged - approxUnacked,
-      'Approx. Unacked % error': round2((queue.messages_unacknowledged - approxUnacked) / queue.messages_unacknowledged * 100),
-    }));
+    await sampleStats();
     await sleep(STATS_LOOP_SLEEP_MS);
   }
 }
+
+// Message generation
 
 class Publisher {
   constructor(connection, channel) {
@@ -123,52 +146,29 @@ class Publisher {
   }
 }
 
-class Consumer {
-  // need to simulate backpressure and buffering messages
-  // need to set prefetch in scale with the message buffer
-  // pull as many messages as possible until buffer is full, then start backpressure
-  // - need control to start and stop connection limiting
-  // - Flink RateLimiter?
+// BackpressureAwareConsumer prototype
 
+class BackpressureAwareConsumer {
+  // need to set prefetch in scale with the message buffer
   // need to allow one message to be pulled at a time from the buffer
 
-  // total messages delivered ~= parallelism * (# messages in consumer buffer + # messages in session ID buffer)
-  //   - also, all messages filtered from session ID buffer but not acked?
   constructor(connection, channel) {
     this.buffer = [];
-    this.maxBufferLength = CONSUMER_MAX_BUFFER;
+    this.maxBufferLength = CONSUMER_MAX_BUFFER_LENGTH;
     this.connection = connection;
     this.channel = channel;
-    this.maxPrefetchAmount = CONSUMER_MAX_BUFFER * PREFETCH_RATIO;
     // if there is still room in the buffer
     // allow as many as possible in
     // NOTE: need to handle v3.3.0 global semantics: https://www.rabbitmq.com/consumer-prefetch.html
-    this.prefetchAmount = false;
+    this.prefetchAmount = CONSUMER_MAX_BUFFER_LENGTH;
     this.channel.prefetch(this.prefetchAmount);
   }
 
   consume() {
     this.channel.consume(QUEUE_NAME, (msg) => {
+      // TODO: incorporate variable prefetch amount
       this.buffer.push(msg);
-      this.configureQos();
     });
-  }
-
-  configureQos() {
-    const curAmount = this.prefetchAmount;
-    // console.debug('Consumer buffer length', this.buffer.length);
-    if (this.buffer.length >= this.maxBufferLength) {
-      // TODO: backpressure here using qos prefetch
-      //    as determined by length of session IDs and current buffer (if buffer is "full")
-      // console.debug('Consumer approx unacked', approxUnacked);
-      // cap it at the current unacked until there is room for more
-      this.prefetchAmount = this.maxPrefetchAmount;
-    } else {
-      this.prefetchAmount = false;
-    }
-    if (curAmount !== this.prefetchAmount) {
-      this.channel.prefetch(this.prefetchAmount);
-    }
   }
 
   getNextMessage() {
@@ -177,33 +177,27 @@ class Consumer {
   }
 }
 
-// one of these will need to monitor the queue for stats
-//    - # messages in queue ready/ delivered/ acked
-//    - # messages delivered/s
-//    - # messages published/s
+// Lifecycle methods
 
 // open the connections to Rabbit for both a publisher and a consumer
 async function open() {
   sessionIds = new Set();
   sessionMessages = [];
 
+  // use different connections for message generation/ consumption
   const pubConn = await amqplib.connect(getConnectionURI());
   const pubChan = await pubConn.createChannel();
   publisher = new Publisher(pubConn, pubChan);
 
   const consConn = await amqplib.connect(getConnectionURI());
   const consChan = await consConn.createChannel();
-  consumer = new Consumer(consConn, consChan);
+  consumer = new BackpressureAwareConsumer(consConn, consChan);
 
   await declareQueue(consChan);
 }
 
 // The main run loop, as in the RMQ source
 async function run() {
-  // on each run loop, do a quick calculation
-  // and set the proper QOS in case of backpressure
-  consumer.configureQos();
-
   // pull off the next message, add to checkpoint buffer
   // ack all message in buffer every x seconds
   const msg = consumer.getNextMessage();
@@ -212,8 +206,7 @@ async function run() {
     console.log(`no available messages`);
     return;
   }
-  // deliveryTag = envelope.deliveryTag
-  // corrId = deliveryTag.props.corrId
+
   const { correlationId } = msg.properties;
   if (sessionIds.has(correlationId)) {
     return;
@@ -249,6 +242,8 @@ async function runLoop(onErr) {
   statsLoop()
     .catch(onErr);
 
+  let lastCheckpointTime = Date.now();
+
   let runNum = 0;
   while (isRunning) {
     runNum += 1;
@@ -256,9 +251,11 @@ async function runLoop(onErr) {
       console.log(`running ${runNum}`);
       await run();
       await sleep(RUN_LOOP_SLEEP_MS);
-      if (runNum % RUN_LOOP_CHECKPOINT_INTERVAL === 0) {
+      const now = Date.now();
+      if (lastCheckpointTime + RUN_LOOP_CHECKPOINT_INTERVAL_MS < now) {
         console.log(`checkpointing run ${runNum}`);
         await ackSessionIds();
+        lastCheckpointTime = now;
       }
     } catch (err) {
       onErr(err);
@@ -273,13 +270,30 @@ async function close() {
   ]);
 }
 
+// main entrypoint
+
 (async () => {
+  const args = yargs
+    .option('purge-queue', {
+      alias: ['purge', 'p'],
+      type: 'boolean',
+      default: false,
+    })
+    .parse();
+
+  shouldPurgeQueue = args['purge-queue'];
+
   const onErr = (err) => {
-    console.error(err);
+    if (err) {
+      console.error(err);
+    }
     isRunning = false;
     publisher.isRunning = false;
   };
+  process.once('SIGINT', e => onErr(e));
   await open();
   await runLoop(onErr);
-  await close().then(console.log);
+  await close();
+  console.log('Connections closed');
+  await sampleStats();
 })();
